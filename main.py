@@ -4,6 +4,7 @@ import argparse
 import mimetypes
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import gradio as gr
@@ -22,7 +23,9 @@ def is_video_file(path: Path) -> bool:
     return bool(mime and mime.startswith("video/"))
 
 
-def extract_audio(video_path: Path, wav_path: Path) -> None:
+def extract_audio(video_path: Path, wav_path: Path, report_progress=None) -> None:
+    if report_progress:
+        report_progress("Extracting audio from video")
     subprocess.run(
         [
             "ffmpeg",
@@ -42,7 +45,9 @@ def extract_audio(video_path: Path, wav_path: Path) -> None:
     )
 
 
-def mux_audio(video_path: Path, audio_path: Path, output_path: Path) -> None:
+def mux_audio(video_path: Path, audio_path: Path, output_path: Path, report_progress=None) -> None:
+    if report_progress:
+        report_progress("Muxing censored audio back into video")
     subprocess.run(
         [
             "ffmpeg",
@@ -72,11 +77,18 @@ def censor_audio_segments(
     batch_size: int,
     compute_type: str,
     pad_ms: int,
+    report_progress=None,
 ) -> None:
-    model = whisperx.load_model("large-v3-turbo", device, compute_type=compute_type, download_root="/bulk/whisper_models")
+    if report_progress:
+        report_progress("Loading WhisperX model")
+    model = whisperx.load_model("large-v3", device, compute_type=compute_type, download_root="/bulk/whisper_models")
+    if report_progress:
+        report_progress("Transcribing audio")
     audio = whisperx.load_audio(audio_path.as_posix())
     result = model.transcribe(audio, batch_size=batch_size, language="en")
 
+    if report_progress:
+        report_progress("Aligning transcript to audio")
     model_a, metadata = whisperx.load_align_model(language_code="en", device=device)
     result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=True)
 
@@ -91,19 +103,46 @@ def censor_audio_segments(
                 censor_times.append({"start": start_ms, "end": end_ms})
 
     print(f"Detected {len(censor_times)} swear words in the audio file")
+    if report_progress:
+        report_progress("Applying censoring")
 
     audio_segment = AudioSegment.from_file(audio_path.as_posix())
     audio_length_ms = len(audio_segment)
-    for censor in censor_times:
+    total_censors = len(censor_times)
+    if total_censors == 0:
+        audio_segment.export(output_path.as_posix(), format=output_path.suffix.lstrip(".") or "mp3")
+        return
+
+    start_time = time.monotonic()
+    last_reported = 0
+    for index, censor in enumerate(censor_times, start=1):
         start_ms = censor["start"]
         end_ms = min(censor["end"], audio_length_ms)
         if end_ms <= start_ms:
             continue
         silence = AudioSegment.silent(duration=end_ms - start_ms)
         audio_segment = audio_segment[:start_ms] + silence + audio_segment[end_ms:]
-        print(f"Censored audio at time {(start_ms//60000)%60:02d}:{(start_ms//1000)%60:02d}")
+        elapsed = time.monotonic() - start_time
+        if index == total_censors or elapsed - last_reported >= 1.0:
+            rate = index / elapsed if elapsed > 0 else 0.0
+            remaining = int((total_censors - index) / rate) if rate > 0 else 0
+            progress_line = (
+                f"Progress: {index}/{total_censors} "
+                f"({index / total_censors:.0%}) - "
+                f"ETA {remaining // 60:02d}:{remaining % 60:02d}"
+            )
+            print(progress_line)
+            if report_progress:
+                report_progress(
+                    "Applying censoring",
+                    index / total_censors,
+                    remaining,
+                )
+            last_reported = elapsed
 
     output_format = output_path.suffix.lstrip(".") or "mp3"
+    if report_progress:
+        report_progress("Exporting censored audio")
     audio_segment.export(output_path.as_posix(), format=output_format)
 
 
@@ -119,6 +158,7 @@ def censor_media_file(
     batch_size: int,
     compute_type: str,
     pad_ms: int,
+    report_progress=None,
 ) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_dir_path = Path(tmp_dir)
@@ -126,7 +166,7 @@ def censor_media_file(
         if treat_as_video:
             extracted_audio = tmp_dir_path / "extracted_audio.wav"
             censored_audio = tmp_dir_path / "censored_audio.wav"
-            extract_audio(input_path, extracted_audio)
+            extract_audio(input_path, extracted_audio, report_progress=report_progress)
             censor_audio_segments(
                 extracted_audio,
                 censored_audio,
@@ -134,8 +174,9 @@ def censor_media_file(
                 batch_size,
                 compute_type,
                 pad_ms,
+                report_progress=report_progress,
             )
-            mux_audio(input_path, censored_audio, output_path)
+            mux_audio(input_path, censored_audio, output_path, report_progress=report_progress)
         else:
             censor_audio_segments(
                 input_path,
@@ -144,10 +185,13 @@ def censor_media_file(
                 batch_size,
                 compute_type,
                 pad_ms,
+                report_progress=report_progress,
             )
 
 
-def download_youtube(url: str, output_dir: Path) -> Path:
+def download_youtube(url: str, output_dir: Path, report_progress=None) -> Path:
+    if report_progress:
+        report_progress("Downloading video")
     output_template = output_dir / "youtube_download.%(ext)s"
     subprocess.run(
         [
@@ -175,15 +219,23 @@ def build_gradio_interface() -> gr.Blocks:
         batch_size: int,
         compute_type: str,
         pad_ms: int,
+        progress=gr.Progress(),
     ) -> str:
         if not input_file and not input_url:
             raise gr.Error("Upload a file or paste a URL.")
         if input_file and input_url:
             raise gr.Error("Provide only one input: file or URL.")
 
+        def report_progress(step: str, fraction: float | None = None, remaining_seconds: int | None = None) -> None:
+            description = step
+            if remaining_seconds is not None:
+                description = f"{step} - ETA {remaining_seconds // 60:02d}:{remaining_seconds % 60:02d}"
+            progress_value = fraction if fraction is not None else 0.0
+            progress(progress_value, desc=description)
+
         output_dir = Path(tempfile.mkdtemp(prefix="autocensor_"))
         if input_url:
-            input_path = download_youtube(input_url.strip(), output_dir)
+            input_path = download_youtube(input_url.strip(), output_dir, report_progress=report_progress)
         else:
             input_path = Path(input_file).expanduser().resolve()
             if not input_path.exists():
@@ -205,7 +257,9 @@ def build_gradio_interface() -> gr.Blocks:
             batch_size,
             compute_type,
             pad_ms,
+            report_progress=report_progress,
         )
+        progress(1.0, desc="Done")
         return output_path.as_posix()
 
     with gr.Blocks(title="AutoCensor") as demo:
@@ -323,7 +377,15 @@ def main() -> None:
             if not input_path.exists():
                 raise FileNotFoundError(f"Input file does not exist: {input_path}")
         else:
-            input_path = download_youtube(args.youtube_url, tmp_dir_path)
+            input_path = download_youtube(args.youtube_url, tmp_dir_path, report_progress=lambda step, *_: print(f"Step: {step}"))
+
+        def report_progress(step: str, fraction: float | None = None, remaining_seconds: int | None = None) -> None:
+            message = f"Step: {step}"
+            if remaining_seconds is not None:
+                message = f"{message} - ETA {remaining_seconds // 60:02d}:{remaining_seconds % 60:02d}"
+            if fraction is not None:
+                message = f"{message} ({fraction:.0%})"
+            print(message)
 
         treat_as_video = is_video_file(input_path)
         output_path = (
@@ -339,6 +401,7 @@ def main() -> None:
             args.batch_size,
             args.compute_type,
             args.pad_ms,
+            report_progress=report_progress,
         )
         if treat_as_video:
             print(f"Censored video file has been saved to {output_path}")
