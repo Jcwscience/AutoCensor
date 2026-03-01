@@ -6,14 +6,22 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from threading import Lock
 
 import gradio as gr
+import torch
 import whisperx
 from better_profanity import profanity
 from pydub import AudioSegment
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+WHISPER_MODEL_NAME = "large-v3"
+WHISPER_MODEL_CACHE_DIR = "/bulk/whisper_models"
+
+_ASR_MODEL_CACHE = {}
+_ALIGN_MODEL_CACHE = {}
+_MODEL_CACHE_LOCK = Lock()
 
 
 def is_video_file(path: Path) -> bool:
@@ -21,6 +29,57 @@ def is_video_file(path: Path) -> bool:
         return True
     mime, _ = mimetypes.guess_type(path.as_posix())
     return bool(mime and mime.startswith("video/"))
+
+
+def configure_torch_for_cuda(device: str) -> None:
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+
+def resolve_device(device: str, cuda_index: int) -> tuple[str, int, str]:
+    device_clean = (device or "cuda").strip().lower()
+    if device_clean == "cpu":
+        return "cpu", 0, "cpu"
+    if not device_clean.startswith("cuda"):
+        raise ValueError(f"Unsupported device '{device}'. Use 'cuda', 'cuda:N', or 'cpu'.")
+
+    resolved_index = max(0, int(cuda_index))
+    if ":" in device_clean:
+        suffix = device_clean.split(":", 1)[1]
+        if suffix.isdigit():
+            resolved_index = int(suffix)
+        elif suffix:
+            raise ValueError(f"Invalid CUDA device index in '{device}'.")
+    return "cuda", resolved_index, f"cuda:{resolved_index}"
+
+
+def get_cached_asr_model(device: str, cuda_index: int, compute_type: str):
+    cache_key = (device, cuda_index, compute_type)
+    with _MODEL_CACHE_LOCK:
+        model = _ASR_MODEL_CACHE.get(cache_key)
+        if model is None:
+            model = whisperx.load_model(
+                WHISPER_MODEL_NAME,
+                device,
+                device_index=cuda_index,
+                compute_type=compute_type,
+                download_root=WHISPER_MODEL_CACHE_DIR,
+            )
+            _ASR_MODEL_CACHE[cache_key] = model
+    return model
+
+
+def get_cached_align_model(language_code: str, align_device: str):
+    cache_key = (language_code, align_device)
+    with _MODEL_CACHE_LOCK:
+        cached = _ALIGN_MODEL_CACHE.get(cache_key)
+        if cached is None:
+            cached = whisperx.load_align_model(language_code=language_code, device=align_device)
+            _ALIGN_MODEL_CACHE[cache_key] = cached
+    return cached
 
 
 def extract_audio(video_path: Path, wav_path: Path, report_progress=None) -> None:
@@ -74,23 +133,34 @@ def censor_audio_segments(
     audio_path: Path,
     output_path: Path,
     device: str,
+    cuda_index: int,
     batch_size: int,
     compute_type: str,
     pad_ms: int,
     report_progress=None,
 ) -> None:
+    whisper_device, resolved_cuda_index, align_device = resolve_device(device, cuda_index)
+    configure_torch_for_cuda(align_device)
+
     if report_progress:
-        report_progress("Loading WhisperX model")
-    model = whisperx.load_model("large-v3", device, compute_type=compute_type, download_root="/bulk/whisper_models")
+        report_progress("Loading WhisperX model (cached)")
+    model = get_cached_asr_model(whisper_device, resolved_cuda_index, compute_type)
     if report_progress:
         report_progress("Transcribing audio")
     audio = whisperx.load_audio(audio_path.as_posix())
     result = model.transcribe(audio, batch_size=batch_size, language="en")
 
     if report_progress:
-        report_progress("Aligning transcript to audio")
-    model_a, metadata = whisperx.load_align_model(language_code="en", device=device)
-    result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=True)
+        report_progress("Aligning transcript to audio (cached)")
+    model_a, metadata = get_cached_align_model(language_code="en", align_device=align_device)
+    result = whisperx.align(
+        result["segments"],
+        model_a,
+        metadata,
+        audio,
+        align_device,
+        return_char_alignments=False,
+    )
 
     censor_times = []
     for segment in result["segments"]:
@@ -146,15 +216,17 @@ def censor_audio_segments(
     audio_segment.export(output_path.as_posix(), format=output_format)
 
 
-def default_output_path(input_path: Path, is_video: bool) -> Path:
+def default_output_path(input_path: Path, is_video: bool, output_dir: Path | None = None) -> Path:
     suffix = input_path.suffix or (".mp4" if is_video else ".mp3")
-    return input_path.with_name(f"{input_path.stem}_censored{suffix}")
+    target_dir = output_dir if output_dir is not None else Path.cwd()
+    return (target_dir / f"{input_path.stem}_censored{suffix}").resolve()
 
 
 def censor_media_file(
     input_path: Path,
     output_path: Path,
     device: str,
+    cuda_index: int,
     batch_size: int,
     compute_type: str,
     pad_ms: int,
@@ -171,6 +243,7 @@ def censor_media_file(
                 extracted_audio,
                 censored_audio,
                 device,
+                cuda_index,
                 batch_size,
                 compute_type,
                 pad_ms,
@@ -182,6 +255,7 @@ def censor_media_file(
                 input_path,
                 output_path,
                 device,
+                cuda_index,
                 batch_size,
                 compute_type,
                 pad_ms,
@@ -216,6 +290,7 @@ def build_gradio_interface() -> gr.Blocks:
         input_url: str,
         output_name: str,
         device: str,
+        cuda_index: int,
         batch_size: int,
         compute_type: str,
         pad_ms: int,
@@ -248,12 +323,13 @@ def build_gradio_interface() -> gr.Blocks:
                 output_name_clean = f"{output_name_clean}{suffix}"
             output_path = output_dir / output_name_clean
         else:
-            output_path = output_dir / f"{input_path.stem}_censored{suffix}"
+            output_path = default_output_path(input_path, is_video_file(input_path), output_dir=output_dir)
 
         censor_media_file(
             input_path,
             output_path,
             device,
+            int(cuda_index or 0),
             batch_size,
             compute_type,
             pad_ms,
@@ -285,6 +361,11 @@ def build_gradio_interface() -> gr.Blocks:
                 value="cuda",
                 label="Device",
             )
+            cuda_index = gr.Number(
+                value=0,
+                precision=0,
+                label="CUDA GPU Index",
+            )
             batch_size = gr.Slider(
                 minimum=1,
                 maximum=64,
@@ -308,7 +389,7 @@ def build_gradio_interface() -> gr.Blocks:
         run_button = gr.Button("Censor and prepare download")
         run_button.click(
             run_censor,
-            inputs=[input_file, input_url, output_name, device, batch_size, compute_type, pad_ms],
+            inputs=[input_file, input_url, output_name, device, cuda_index, batch_size, compute_type, pad_ms],
             outputs=output_file,
         )
     return demo
@@ -330,6 +411,7 @@ def main() -> None:
     )
     parser.add_argument("--input_file", type=str, nargs="?", help="Path to the audio or video file to censor")
     parser.add_argument("--device", type=str, default="cuda", help="Device for whisperx (cuda or cpu)")
+    parser.add_argument("--cuda_index", type=int, default=0, help="CUDA GPU index to use when device is cuda")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for whisperx")
     parser.add_argument(
         "--compute_type",
@@ -391,13 +473,14 @@ def main() -> None:
         output_path = (
             Path(args.output_file).expanduser().resolve()
             if args.output_file
-            else default_output_path(input_path, treat_as_video)
+            else default_output_path(input_path, treat_as_video, output_dir=Path.cwd())
         )
 
         censor_media_file(
             input_path,
             output_path,
             args.device,
+            args.cuda_index,
             args.batch_size,
             args.compute_type,
             args.pad_ms,
