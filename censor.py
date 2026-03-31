@@ -16,7 +16,7 @@ from pydub import AudioSegment
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
-WHISPER_MODEL_NAME = "large-v3"
+WHISPER_MODEL_NAME = "large-v3-turbo"
 WHISPER_MODEL_CACHE_DIR = "/bulk/whisper_models"
 
 _ASR_MODEL_CACHE = {}
@@ -36,7 +36,8 @@ def configure_torch_for_cuda(device: str) -> None:
         return
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+    # Alignment runs on variable-length chunks; benchmark mode can thrash on shape autotuning.
+    torch.backends.cudnn.benchmark = False
 
 
 def resolve_device(device: str, cuda_index: int) -> tuple[str, int, str]:
@@ -160,6 +161,7 @@ def censor_audio_segments(
         audio,
         align_device,
         return_char_alignments=False,
+        print_progress=True,
     )
 
     censor_times = []
