@@ -1,5 +1,3 @@
-#!/home/john/Programs/miniconda3/envs/autocensor/bin/python3
-
 import argparse
 import mimetypes
 import subprocess
@@ -22,6 +20,14 @@ WHISPER_MODEL_CACHE_DIR = "/bulk/whisper_models"
 _ASR_MODEL_CACHE = {}
 _ALIGN_MODEL_CACHE = {}
 _MODEL_CACHE_LOCK = Lock()
+
+
+def run_command(args: list[str], *, suppress_output: bool = False) -> None:
+    kwargs = {"check": True}
+    if suppress_output:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    subprocess.run(args, **kwargs)
 
 
 def is_video_file(path: Path) -> bool:
@@ -86,7 +92,7 @@ def get_cached_align_model(language_code: str, align_device: str):
 def extract_audio(video_path: Path, wav_path: Path, report_progress=None) -> None:
     if report_progress:
         report_progress("Extracting audio from video")
-    subprocess.run(
+    run_command(
         [
             "ffmpeg",
             "-y",
@@ -99,16 +105,15 @@ def extract_audio(video_path: Path, wav_path: Path, report_progress=None) -> Non
             "16000",
             wav_path.as_posix(),
         ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        suppress_output=True,
     )
 
 
 def mux_audio(video_path: Path, audio_path: Path, output_path: Path, report_progress=None) -> None:
     if report_progress:
         report_progress("Muxing censored audio back into video")
-    subprocess.run(
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run_command(
         [
             "ffmpeg",
             "-y",
@@ -124,9 +129,7 @@ def mux_audio(video_path: Path, audio_path: Path, output_path: Path, report_prog
             "1:a:0",
             output_path.as_posix(),
         ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        suppress_output=True,
     )
 
 
@@ -181,6 +184,7 @@ def censor_audio_segments(
     audio_segment = AudioSegment.from_file(audio_path.as_posix())
     audio_length_ms = len(audio_segment)
     total_censors = len(censor_times)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     if total_censors == 0:
         audio_segment.export(output_path.as_posix(), format=output_path.suffix.lstrip(".") or "mp3")
         return
@@ -269,7 +273,7 @@ def download_youtube(url: str, output_dir: Path, report_progress=None) -> Path:
     if report_progress:
         report_progress("Downloading video")
     output_template = output_dir / "youtube_download.%(ext)s"
-    subprocess.run(
+    run_command(
         [
             "yt-dlp",
             "-f",
@@ -278,12 +282,35 @@ def download_youtube(url: str, output_dir: Path, report_progress=None) -> Path:
             output_template.as_posix(),
             url,
         ],
-        check=True,
     )
     matches = sorted(output_dir.glob("youtube_download.*"))
     if not matches:
         raise FileNotFoundError("yt-dlp did not produce an output file")
     return matches[0]
+
+
+def validate_media_path(input_path: Path) -> Path:
+    resolved_path = input_path.expanduser().resolve()
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Input file does not exist: {resolved_path}")
+    if not resolved_path.is_file():
+        raise ValueError(f"Input path is not a file: {resolved_path}")
+    return resolved_path
+
+
+def choose_output_path(
+    requested_output: str | None,
+    input_path: Path,
+    output_dir: Path | None = None,
+) -> Path:
+    treat_as_video = is_video_file(input_path)
+    if requested_output:
+        output_path = Path(requested_output).expanduser()
+        if not output_path.suffix:
+            suffix = input_path.suffix or (".mp4" if treat_as_video else ".mp3")
+            output_path = output_path.with_suffix(suffix)
+        return output_path.resolve()
+    return default_output_path(input_path, treat_as_video, output_dir=output_dir)
 
 
 def build_gradio_interface() -> gr.Blocks:
@@ -314,18 +341,13 @@ def build_gradio_interface() -> gr.Blocks:
         if input_url:
             input_path = download_youtube(input_url.strip(), output_dir, report_progress=report_progress)
         else:
-            input_path = Path(input_file).expanduser().resolve()
-            if not input_path.exists():
-                raise gr.Error("Uploaded file could not be found on disk.")
+            try:
+                input_path = validate_media_path(Path(input_file))
+            except (FileNotFoundError, ValueError) as exc:
+                raise gr.Error(str(exc)) from exc
 
-        suffix = input_path.suffix or (".mp4" if is_video_file(input_path) else ".mp3")
-        if output_name and output_name.strip():
-            output_name_clean = Path(output_name.strip()).name
-            if not Path(output_name_clean).suffix:
-                output_name_clean = f"{output_name_clean}{suffix}"
-            output_path = output_dir / output_name_clean
-        else:
-            output_path = default_output_path(input_path, is_video_file(input_path), output_dir=output_dir)
+        output_name_clean = Path(output_name.strip()).name if output_name and output_name.strip() else None
+        output_path = choose_output_path(output_name_clean, input_path, output_dir=output_dir)
 
         censor_media_file(
             input_path,
@@ -412,14 +434,14 @@ def main() -> None:
         help="Path to save the censored output",
     )
     parser.add_argument("--input_file", type=str, nargs="?", help="Path to the audio or video file to censor")
-    parser.add_argument("--device", type=str, default="cuda", help="Device for whisperx (cuda or cpu)")
+    parser.add_argument("--device", type=str, default="cuda", help="Device for whisperx (cuda, cuda:N, or cpu)")
     parser.add_argument("--cuda_index", type=int, default=0, help="CUDA GPU index to use when device is cuda")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for whisperx")
     parser.add_argument(
         "--compute_type",
         type=str,
         default="float16",
-        help="Compute type for whisperx (float16 or int8)",
+        help="Compute type for whisperx (float16, int8, or int8_float16)",
     )
     parser.add_argument(
         "--pad_ms",
@@ -457,9 +479,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_dir_path = Path(tmp_dir)
         if args.input_file:
-            input_path = Path(args.input_file).expanduser().resolve()
-            if not input_path.exists():
-                raise FileNotFoundError(f"Input file does not exist: {input_path}")
+            input_path = validate_media_path(Path(args.input_file))
         else:
             input_path = download_youtube(args.youtube_url, tmp_dir_path, report_progress=lambda step, *_: print(f"Step: {step}"))
 
@@ -472,11 +492,7 @@ def main() -> None:
             print(message)
 
         treat_as_video = is_video_file(input_path)
-        output_path = (
-            Path(args.output_file).expanduser().resolve()
-            if args.output_file
-            else default_output_path(input_path, treat_as_video, output_dir=Path.cwd())
-        )
+        output_path = choose_output_path(args.output_file, input_path, output_dir=Path.cwd())
 
         censor_media_file(
             input_path,
